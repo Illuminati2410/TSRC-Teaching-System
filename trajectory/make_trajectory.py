@@ -5,8 +5,8 @@ import numpy as np
 # SETTINGS
 # ==========================================
 
-INPUT_FILE = "tracker_data.csv"
-OUTPUT_FILE = "fairino_path.txt"
+INPUT_FILE = "data/tracker_data.csv"
+OUTPUT_FILE = "simulation/fairino_path.txt"
 
 SCALE = 0.5
 

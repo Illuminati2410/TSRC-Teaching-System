@@ -3,11 +3,12 @@ import math
 import csv
 import os
 
-with open("tracker_data.csv", "w", newline="") as f:
+with open(csv_file, "a", newline="") as f:
     writer = csv.writer(f)
     writer.writerow(
-        ["time","x","y","z","roll","pitch","yaw"]
+        [t, x, y, z, roll, pitch, yaw]
     )
+    f.flush()
 
 def quat_to_rpy(qw, qx, qy, qz):
     sinr_cosp = 2 * (qw * qx + qy * qz)
@@ -30,7 +31,7 @@ def quat_to_rpy(qw, qx, qy, qz):
         math.degrees(yaw)
     )
 
-csv_file = "tracker_data.csv"
+csv_file = "data/tracker_data.csv"
 last_x = None
 last_y = None
 last_z = None
@@ -100,7 +101,26 @@ for line in proc.stdout:
         x_mm = x * 1000
         y_mm = y * 1000
         z_mm = z * 1000
+        if last_x is not None:
 
+            dx = abs(x_mm - last_x)
+            dy = abs(y_mm - last_y)
+            dz = abs(z_mm - last_z)
+
+            if dx > 200 or dy > 200 or dz > 200:
+
+                print(
+                    f"JUMP REJECTED "
+                    f"dx={dx:.1f} "
+                    f"dy={dy:.1f} "
+                    f"dz={dz:.1f}"
+                )
+
+                continue
+
+        last_x = x_mm
+        last_y = y_mm
+        last_z = z_mm
         print(
             f"t={t:.2f} "
             f"X={x_mm:.1f} mm "
@@ -120,3 +140,4 @@ for line in proc.stdout:
     except Exception as e:
         print("Parse Error:", e)
 
+print(line.strip())
