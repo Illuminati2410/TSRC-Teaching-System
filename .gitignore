@@ -1,0 +1,16 @@
+# Generated trajectory files
+fairino_path.txt
+
+# Temporary logs
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# VS Code
+.vscode/
+
+# Windows
+Thumbs.db
+Desktop.ini
