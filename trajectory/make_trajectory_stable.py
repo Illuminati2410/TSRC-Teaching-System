@@ -14,9 +14,9 @@ OUTPUT_FILE = os.path.join(BASE_DIR, "simulation", "fairino_path.txt")
 
 SCALE = 0.2
 
-START_X = 255
-START_Y = -380
-START_Z = 180
+START_X = 300
+START_Y = -500
+START_Z = 450
 
 START_ROLL = 180
 START_PITCH = 0
@@ -91,14 +91,14 @@ print("\nBad rows found:", bad_rows)
 # TRAJECTORY CENTER
 # ==========================================
 
-tracker_x0 = x[0]
-tracker_y0 = y[0]
-tracker_z0 = z[0]
+cx = np.median(x)
+cy = np.median(y)
+cz = np.median(z)
 
-print("\nTracker Reference Pose")
-print(f"X0 = {tracker_x0:.1f}")
-print(f"Y0 = {tracker_y0:.1f}")
-print(f"Z0 = {tracker_z0:.1f}")
+print("\nTracker Center")
+print(f"CX = {cx:.1f}")
+print(f"CY = {cy:.1f}")
+print(f"CZ = {cz:.1f}")
 
 # ==========================================
 # RAW TRACKER LIMITS
@@ -164,13 +164,9 @@ print(f"\nTotal raw tracker jumps found = {tracker_jump_count}")
 # TRANSFORM TO ROBOT SPACE
 # ==========================================
 
-dx = x - tracker_x0
-dy = y - tracker_y0
-dz = z - tracker_z0
-
-robot_x = START_X + dx * SCALE
-robot_y = START_Y + dy * SCALE
-robot_z = START_Z + dz * SCALE
+robot_x = (x - cx) * SCALE + START_X
+robot_y = (y - cy) * SCALE + START_Y
+robot_z = (z - cz) * SCALE + START_Z
 
 robot_x = np.clip(robot_x, 150, 550)
 robot_y = np.clip(robot_y, -550, -350)
@@ -278,7 +274,7 @@ with open(OUTPUT_FILE, "w") as f:
     last_py = START_Y
     last_pz = START_Z
 
-    for i in range(STEP, len(robot_x), STEP):
+    for i in range(0, len(robot_x), STEP):
 
         SKIP_RADIUS = 20
 
@@ -336,7 +332,6 @@ with open(OUTPUT_FILE, "w") as f:
             f"{pz:.3f}"
         )
 
-
         f.write(
             f"{px:.3f} "
             f"{py:.3f} "
@@ -391,13 +386,3 @@ print(
 print(
     f"Z span = {robot_z.max()-robot_z.min():.1f}"
 )
-
-
-print("\nReference Offsets")
-print(f"tracker_x0 = {tracker_x0:.1f}")
-print(f"tracker_y0 = {tracker_y0:.1f}")
-print(f"tracker_z0 = {tracker_z0:.1f}")
-
-print(f"tracker_x_median = {np.median(x):.1f}")
-print(f"tracker_y_median = {np.median(y):.1f}")
-print(f"tracker_z_median = {np.median(z):.1f}")
