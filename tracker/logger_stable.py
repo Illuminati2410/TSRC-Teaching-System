@@ -88,7 +88,46 @@ proc = subprocess.Popen(
     text=True,
     bufsize=1
 )
+print("\nTracker stabilization...")
+print("Please hold tracker still...")
 
+stabilization_samples = []
+
+while len(stabilization_samples) < 100:
+
+    line = proc.stdout.readline()
+
+    if "POSE" not in line:
+        continue
+
+    parts = line.split()
+
+    try:
+
+        t = float(parts[0])
+
+        if t < 3.0:
+            continue
+
+        x = float(parts[3]) * 1000
+        y = float(parts[4]) * 1000
+        z = float(parts[5]) * 1000
+
+        stabilization_samples.append((x, y, z))
+
+    except:
+        continue
+
+tracker_x0 = sum(p[0] for p in stabilization_samples) / len(stabilization_samples)
+tracker_y0 = sum(p[1] for p in stabilization_samples) / len(stabilization_samples)
+tracker_z0 = sum(p[2] for p in stabilization_samples) / len(stabilization_samples)
+
+print("\nTracker Neutral Reference")
+print(f"X0 = {tracker_x0:.3f}")
+print(f"Y0 = {tracker_y0:.3f}")
+print(f"Z0 = {tracker_z0:.3f}")
+
+print("\nStarting actual recording...\n")
 for line in proc.stdout:
 
     if "POSE" not in line:

@@ -14,15 +14,15 @@ OUTPUT_FILE = os.path.join(BASE_DIR, "simulation", "fairino_path.txt")
 
 SCALE = 0.2
 
-START_X = 300
-START_Y = -500
-START_Z = 450
+START_X = 260
+START_Y = -400
+START_Z = 300
 
 START_ROLL = 180
 START_PITCH = 0
 START_YAW = 90
 
-STEP = 20
+STEP = 10
 
 # Maximum allowed jump between saved points (mm)
 MAX_JUMP = 150
@@ -59,6 +59,12 @@ z = df["z"].to_numpy() * 1000
 roll = df["unwrapped_roll"].to_numpy()
 pitch = df["unwrapped_pitch"].to_numpy()
 yaw = df["unwrapped_yaw"].to_numpy()
+ROT_SCALE = 0.5
+PITCH_SCALE = 0.3
+
+roll0 = roll[0]
+pitch0 = pitch[0]
+yaw0 = yaw[0]
 # ==========================================
 # FIND BAD TRACKER JUMPS
 # ==========================================
@@ -91,14 +97,14 @@ print("\nBad rows found:", bad_rows)
 # TRAJECTORY CENTER
 # ==========================================
 
-cx = np.median(x)
-cy = np.median(y)
-cz = np.median(z)
+tracker_x0 = x[0]
+tracker_y0 = y[0]
+tracker_z0 = z[0]
 
-print("\nTracker Center")
-print(f"CX = {cx:.1f}")
-print(f"CY = {cy:.1f}")
-print(f"CZ = {cz:.1f}")
+print("\nTracker Reference Pose")
+print(f"X0 = {tracker_x0:.1f}")
+print(f"Y0 = {tracker_y0:.1f}")
+print(f"Z0 = {tracker_z0:.1f}")
 
 # ==========================================
 # RAW TRACKER LIMITS
@@ -164,9 +170,13 @@ print(f"\nTotal raw tracker jumps found = {tracker_jump_count}")
 # TRANSFORM TO ROBOT SPACE
 # ==========================================
 
-robot_x = (x - cx) * SCALE + START_X
-robot_y = (y - cy) * SCALE + START_Y
-robot_z = (z - cz) * SCALE + START_Z
+dx = x - tracker_x0
+dy = y - tracker_y0
+dz = z - tracker_z0
+
+robot_x = START_X + dx * SCALE
+robot_y = START_Y + dy * SCALE
+robot_z = START_Z + dz * SCALE
 
 robot_x = np.clip(robot_x, 150, 550)
 robot_y = np.clip(robot_y, -550, -350)
@@ -274,7 +284,7 @@ with open(OUTPUT_FILE, "w") as f:
     last_py = START_Y
     last_pz = START_Z
 
-    for i in range(0, len(robot_x), STEP):
+    for i in range(STEP, len(robot_x), STEP):
 
         SKIP_RADIUS = 20
 
@@ -301,8 +311,15 @@ with open(OUTPUT_FILE, "w") as f:
         pz = robot_z[i]
 
         pr = START_ROLL
-        pp = START_PITCH
-        pyaw = START_YAW
+
+        roll_offset = roll[i] - roll0
+        pp = START_PITCH + roll_offset * PITCH_SCALE
+
+        yaw_offset = yaw[i] - yaw0
+        pyaw = START_YAW + yaw_offset * ROT_SCALE
+
+        pp = wrap_angle(pp)
+        pyaw = wrap_angle(pyaw)
 
         dx = abs(px - last_px)
         dy = abs(py - last_py)
@@ -330,6 +347,13 @@ with open(OUTPUT_FILE, "w") as f:
             f"{px:.3f} "
             f"{py:.3f} "
             f"{pz:.3f}"
+        )
+
+        print(
+            f"RollOffset={roll_offset:.1f} "
+            f"RobotPitch={pp:.1f} "
+            f"YawOffset={yaw_offset:.1f} "
+            f"RobotYaw={pyaw:.1f}"
         )
 
         f.write(
@@ -386,3 +410,16 @@ print(
 print(
     f"Z span = {robot_z.max()-robot_z.min():.1f}"
 )
+
+print("Roll :", roll.min(), roll.max())
+print("Pitch:", pitch.min(), pitch.max())
+print("Yaw  :", yaw.min(), yaw.max())
+
+print("\nReference Offsets")
+print(f"tracker_x0 = {tracker_x0:.1f}")
+print(f"tracker_y0 = {tracker_y0:.1f}")
+print(f"tracker_z0 = {tracker_z0:.1f}")
+
+print(f"tracker_x_median = {np.median(x):.1f}")
+print(f"tracker_y_median = {np.median(y):.1f}")
+print(f"tracker_z_median = {np.median(z):.1f}")

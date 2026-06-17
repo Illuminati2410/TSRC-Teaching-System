@@ -1,6 +1,19 @@
 import pandas as pd
 import numpy as np
 import os
+
+def unwrap_angle(previous, current):
+
+    if previous is None:
+        return current
+
+    while current - previous > 180:
+        current -= 360
+
+    while current - previous < -180:
+        current += 360
+
+    return current
 def wrap_angle(angle):
     return (angle + 180) % 360 - 180
 # ==========================================
@@ -14,15 +27,15 @@ OUTPUT_FILE = os.path.join(BASE_DIR, "simulation", "fairino_path.txt")
 
 SCALE = 0.2
 
-START_X = 255
-START_Y = -380
-START_Z = 180
+START_X = 260
+START_Y = -400
+START_Z = 300
 
 START_ROLL = 180
 START_PITCH = 0
 START_YAW = 90
 
-STEP = 20
+STEP = 10
 
 # Maximum allowed jump between saved points (mm)
 MAX_JUMP = 150
@@ -30,6 +43,22 @@ MAX_JUMP = 150
 # Maximum allowed jump between raw tracker samples (mm)
 MAX_TRACKER_JUMP = 200
 MAX_ORIENTATION_JUMP = 45
+
+
+def quat_conjugate(q):
+    w, x, y, z = q
+    return np.array([w, -x, -y, -z])
+
+def quat_multiply(a, b):
+    aw, ax, ay, az = a
+    bw, bx, by, bz = b
+
+    return np.array([
+        aw*bw - ax*bx - ay*by - az*bz,
+        aw*bx + ax*bw + ay*bz - az*by,
+        aw*by - ax*bz + ay*bw + az*bx,
+        aw*bz + ax*by - ay*bx + az*bw
+    ])
 # ==========================================
 # LOAD DATA
 # ==========================================
@@ -52,13 +81,50 @@ if missing_columns:
 
 if df.empty:
     raise ValueError("tracker_data.csv has no samples")
-
+qw = df["qw"].to_numpy()
+qx = df["qx"].to_numpy()
+qy = df["qy"].to_numpy()
+qz = df["qz"].to_numpy()
+q0 = np.array([
+    qw[0],
+    qx[0],
+    qy[0],
+    qz[0]
+])
 x = df["x"].to_numpy() * 1000
 y = df["y"].to_numpy() * 1000
 z = df["z"].to_numpy() * 1000
 roll = df["unwrapped_roll"].to_numpy()
 pitch = df["unwrapped_pitch"].to_numpy()
 yaw = df["unwrapped_yaw"].to_numpy()
+ROT_SCALE = 0.5
+PITCH_SCALE = 0.3
+
+roll0 = roll[0]
+pitch0 = pitch[0]
+yaw0 = yaw[0]
+
+
+def quat_to_rpy(q):
+
+    w, x, y, z = q
+
+    sinr_cosp = 2 * (w*x + y*z)
+    cosr_cosp = 1 - 2 * (x*x + y*y)
+    roll = np.degrees(np.arctan2(sinr_cosp, cosr_cosp))
+
+    sinp = 2 * (w*y - z*x)
+
+    if abs(sinp) >= 1:
+        pitch = np.degrees(np.sign(sinp) * np.pi/2)
+    else:
+        pitch = np.degrees(np.arcsin(sinp))
+
+    siny_cosp = 2 * (w*z + x*y)
+    cosy_cosp = 1 - 2 * (y*y + z*z)
+    yaw = np.degrees(np.arctan2(siny_cosp, cosy_cosp))
+
+    return roll, pitch, yaw
 # ==========================================
 # FIND BAD TRACKER JUMPS
 # ==========================================
@@ -70,11 +136,17 @@ for i in range(1, len(x)):
     dx = abs(x[i] - x[i - 1])
     dy = abs(y[i] - y[i - 1])
     dz = abs(z[i] - z[i - 1])
+    #droll = abs(roll[i] - roll[i - 1])
+    #dpitch = abs(pitch[i] - pitch[i - 1])
+    #dyaw = abs(yaw[i] - yaw[i - 1])
 
     if (
         dx > MAX_TRACKER_JUMP
         or dy > MAX_TRACKER_JUMP
         or dz > MAX_TRACKER_JUMP
+        #or droll > 20
+        #or dpitch > 20
+        #or dyaw > 20
     ):
 
         bad_rows.append(i)
@@ -230,6 +302,10 @@ for i in range(1, len(robot_x)):
 
 print(f"\nTotal jumps found = {jump_count}")
 
+all_roll = []
+all_pitch = []
+all_yaw = []
+
 # ==========================================
 # SAVE FAIRINO FILE
 # ==========================================
@@ -245,7 +321,15 @@ last_py = None
 last_pz = None
 
 os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
-
+max_roll_step = 0
+max_pitch_step = 0
+max_yaw_step = 0
+max_roll_index = -1
+max_pitch_index = -1
+max_yaw_index = -1
+prev_pr = None
+prev_pp = None
+prev_pyaw = None
 with open(OUTPUT_FILE, "w") as f:
 
     # ----------------------------------
@@ -277,10 +361,12 @@ with open(OUTPUT_FILE, "w") as f:
     last_px = START_X
     last_py = START_Y
     last_pz = START_Z
-
+    prev_droll = None
+    prev_dpitch = None
+    prev_dyaw = None
     for i in range(STEP, len(robot_x), STEP):
 
-        SKIP_RADIUS = 20
+        SKIP_RADIUS = 5
 
         skip_point = False
 
@@ -305,29 +391,91 @@ with open(OUTPUT_FILE, "w") as f:
         pz = robot_z[i]
 
         pr = START_ROLL
-        pp = START_PITCH
-        pyaw = START_YAW
+
+        q_current = np.array([
+            qw[i],
+            qx[i],
+            qy[i],
+            qz[i]
+        ])
+
+        q_rel = quat_multiply(
+            quat_conjugate(q0),
+            q_current
+        )
+        q_rel = q_rel / np.linalg.norm(q_rel)
+        if count < 10:
+            print(
+                f"QREL "
+                f"{q_rel[0]:.4f} "
+                f"{q_rel[1]:.4f} "
+                f"{q_rel[2]:.4f} "
+                f"{q_rel[3]:.4f}"
+            )
+
+        droll, dpitch, dyaw = quat_to_rpy(q_rel)
+        droll  = unwrap_angle(prev_droll, droll)
+        dpitch = unwrap_angle(prev_dpitch, dpitch)
+        dyaw   = unwrap_angle(prev_dyaw, dyaw)
+
+        prev_droll  = droll
+        prev_dpitch = dpitch
+        prev_dyaw   = dyaw
+
+        ROLL_GAIN = 0.3
+        PITCH_GAIN = 0.3
+        YAW_GAIN = 0.3
+
+        pr   = START_ROLL  + droll  * ROLL_GAIN
+        pp   = START_PITCH + dpitch * PITCH_GAIN
+        pyaw = START_YAW   + dyaw   * YAW_GAIN
+
+        #pr   = wrap_angle(pr)
+        #pp   = wrap_angle(pp)
+        #pyaw = wrap_angle(pyaw)
+        if prev_pr is None:
+
+            roll_step = 0
+            pitch_step = 0
+            yaw_step = 0
+
+        else:
+
+            roll_step = abs(pr - prev_pr)
+            pitch_step = abs(pp - prev_pp)
+            yaw_step = abs(pyaw - prev_pyaw)
+
+            if roll_step > max_roll_step:
+                max_roll_step = roll_step
+                max_roll_index = count
+
+            if pitch_step > max_pitch_step:
+                max_pitch_step = pitch_step
+                max_pitch_index = count
+
+            if yaw_step > max_yaw_step:
+                max_yaw_step = yaw_step
+                max_yaw_index = count
+
+        print(
+            f"STEP R={roll_step:.2f} "
+            f"P={pitch_step:.2f} "
+            f"Y={yaw_step:.2f}"
+        )
+
+        prev_pr = pr
+        prev_pp = pp
+        prev_pyaw = pyaw
+
+        all_roll.append(pr)
+        all_pitch.append(pp)
+        all_yaw.append(pyaw)
 
         dx = abs(px - last_px)
         dy = abs(py - last_py)
         dz = abs(pz - last_pz)
 
-        if (
-            dx > MAX_JUMP
-            or dy > MAX_JUMP
-            or dz > MAX_JUMP
-        ):
-
-            skipped += 1
-
-            print(
-                f"SKIPPED JUMP "
-                f"dx={dx:.1f} "
-                f"dy={dy:.1f} "
-                f"dz={dz:.1f}"
-            )
-
-            continue
+        
 
         print(
             f"{count:03d}: "
@@ -336,6 +484,13 @@ with open(OUTPUT_FILE, "w") as f:
             f"{pz:.3f}"
         )
 
+        print(
+            f"dRoll={droll:.1f} "
+            f"dPitch={dpitch:.1f} "
+            f"dYaw={dyaw:.1f}"
+        )
+
+        
 
         f.write(
             f"{px:.3f} "
@@ -351,6 +506,10 @@ with open(OUTPUT_FILE, "w") as f:
         last_pz = pz
 
         count += 1
+print("\nOrientation Range")
+print("Roll :", min(all_roll), max(all_roll))
+print("Pitch:", min(all_pitch), max(all_pitch))
+print("Yaw  :", min(all_yaw), max(all_yaw))
 
 print("len(robot_x) =", len(robot_x))
 print("STEP =", STEP)
@@ -358,7 +517,13 @@ print("Expected points =", len(range(0, len(robot_x), STEP)))
 
 print("\nPoints written =", count)
 print("Points skipped =", skipped)
-
+print("\nMaximum Orientation Step")
+print(f"Roll  = {max_roll_step:.2f}")
+print(f"Pitch = {max_pitch_step:.2f}")
+print(f"Yaw   = {max_yaw_step:.2f}")
+print(f"Roll Point  = {max_roll_index}")
+print(f"Pitch Point = {max_pitch_index}")
+print(f"Yaw Point   = {max_yaw_index}")
 print(f"\nSaved: {OUTPUT_FILE}")
 
 print("\nFirst generated pose")
@@ -392,6 +557,9 @@ print(
     f"Z span = {robot_z.max()-robot_z.min():.1f}"
 )
 
+print("Roll :", roll.min(), roll.max())
+print("Pitch:", pitch.min(), pitch.max())
+print("Yaw  :", yaw.min(), yaw.max())
 
 print("\nReference Offsets")
 print(f"tracker_x0 = {tracker_x0:.1f}")
@@ -401,3 +569,4 @@ print(f"tracker_z0 = {tracker_z0:.1f}")
 print(f"tracker_x_median = {np.median(x):.1f}")
 print(f"tracker_y_median = {np.median(y):.1f}")
 print(f"tracker_z_median = {np.median(z):.1f}")
+
