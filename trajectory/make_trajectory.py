@@ -1,19 +1,54 @@
+import sys
+import os
+# Force this script to look directly inside your Miniconda library node
+sys.path.insert(0, r"C:\Users\Shaurya\miniconda3\Lib\site-packages")
+sys.path.insert(
+    0,
+    r"C:\Users\Shaurya\libsurvive\build-win\Release\tracker_logger\fairino-python-sdk-v2.1.4_robot3.8.4\windows"
+)
+from fairino import Robot
 import pandas as pd
 import numpy as np
-import os
+from scipy.spatial.transform import Rotation as R
 
-def unwrap_angle(previous, current):
+# ==========================================
+# FAIRINO IK ANALYSIS — OPTIONAL MODULE
+# ==========================================
+# Set ENABLE_IK_ANALYSIS = True when a live robot controller
+# (or compatible simulator) is reachable at ROBOT_IP.
+# When False the script behaves exactly as before; no SDK calls
+# are made and fairino_path.txt is written unchanged.
+#
+# Future scaling hooks live in IKScaleConfig (do not implement yet).
+# ==========================================
 
-    if previous is None:
-        return current
+ENABLE_IK_ANALYSIS = True          # ← flip to False to skip IK entirely
+ROBOT_IP           = "192.168.86.128"
 
-    while current - previous > 180:
-        current -= 360
+# Seed joint angles used for the very first IK call (safe home pose).
+# GetInverseKinRef needs a reference; subsequent calls chain automatically.
+IK_SEED_JOINTS = [0.0, -60.0, 90.0, -30.0, -90.0, 0.0]
 
-    while current - previous < -180:
-        current += 360
+# ── Future scaling architecture (not implemented yet) ──────────────────────────
+# When you are ready to add per-axis scaling for trajectory compression / expansion,
+# populate IKScaleConfig and pass it into build_trajectory().  All current
+# trajectory math stays untouched; the config object is the single extension point.
+class IKScaleConfig:
+    """
+    Placeholder for future per-axis trajectory scaling.
 
-    return current
+    Fields (not used yet):
+        scale_x, scale_y, scale_z  – independent axis multipliers
+        auto_scale                 – enable automatic workspace fitting
+    """
+    scale_x    = None   # not implemented
+    scale_y    = None   # not implemented
+    scale_z    = None   # not implemented
+    auto_scale = False  # not implemented
+
+# ──────────────────────────────────────────────────────────────────────────────
+
+
 def wrap_angle(angle):
     return (angle + 180) % 360 - 180
 # ==========================================
@@ -25,7 +60,7 @@ BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 INPUT_FILE = os.path.join(BASE_DIR, "data", "tracker_data.csv")
 OUTPUT_FILE = os.path.join(BASE_DIR, "simulation", "fairino_path.txt")
 
-SCALE = 0.2
+SCALE = 0.35
 
 START_X = 260
 START_Y = -400
@@ -36,13 +71,15 @@ START_PITCH = 0
 START_YAW = 90
 
 STEP = 10
-
+DEBUG_START = 175
+DEBUG_END = 225
 # Maximum allowed jump between saved points (mm)
 MAX_JUMP = 150
 
 # Maximum allowed jump between raw tracker samples (mm)
 MAX_TRACKER_JUMP = 200
 MAX_ORIENTATION_JUMP = 45
+MAX_ROBOT_ORIENTATION_STEP = 5.0
 
 
 def quat_conjugate(q):
@@ -59,6 +96,20 @@ def quat_multiply(a, b):
         aw*by - ax*bz + ay*bw + az*bx,
         aw*bz + ax*by - ay*bx + az*bw
     ])
+
+
+def normalize_quat(q):
+    return q / np.linalg.norm(q)
+
+
+def keep_quat_same_hemisphere(q, previous_q):
+    if previous_q is not None and np.dot(q, previous_q) < 0:
+        return -q
+
+    return q
+
+
+
 # ==========================================
 # LOAD DATA
 # ==========================================
@@ -70,6 +121,10 @@ required_columns = [
     "x",
     "y",
     "z",
+    "qw",
+    "qx",
+    "qy",
+    "qz",
     "unwrapped_roll",
     "unwrapped_pitch",
     "unwrapped_yaw",
@@ -81,23 +136,31 @@ if missing_columns:
 
 if df.empty:
     raise ValueError("tracker_data.csv has no samples")
-qw = df["qw"].to_numpy()
-qx = df["qx"].to_numpy()
-qy = df["qy"].to_numpy()
-qz = df["qz"].to_numpy()
+qx_col = df["qx"].to_numpy()   # survive field qx (scalar-last convention in CSV)
+qy_col = df["qy"].to_numpy()
+qz_col = df["qz"].to_numpy()
+qw_col = df["qw"].to_numpy()   # survive field qw
+
+# Internal convention throughout make_trajectory is [w, x, y, z] (scalar-first).
+# Map CSV columns → internal arrays.
+qw = qw_col
+qx = qx_col
+qy = qy_col
+qz = qz_col
 q0 = np.array([
     qw[0],
     qx[0],
     qy[0],
     qz[0]
 ])
+q0 = normalize_quat(q0)
 x = df["x"].to_numpy() * 1000
 y = df["y"].to_numpy() * 1000
 z = df["z"].to_numpy() * 1000
 roll = df["unwrapped_roll"].to_numpy()
 pitch = df["unwrapped_pitch"].to_numpy()
 yaw = df["unwrapped_yaw"].to_numpy()
-ROT_SCALE = 0.5
+ROT_SCALE = 0.3
 PITCH_SCALE = 0.3
 
 roll0 = roll[0]
@@ -125,6 +188,155 @@ def quat_to_rpy(q):
     yaw = np.degrees(np.arctan2(siny_cosp, cosy_cosp))
 
     return roll, pitch, yaw
+
+def quat_to_rotvec_degrees(q):
+
+    w, x, y, z = q
+    q = normalize_quat(np.array([w, x, y, z]))
+
+    # q and -q describe the same orientation. Use the shortest-axis
+    # representation before taking the quaternion logarithm.
+    if q[0] < 0:
+        q = -q
+
+    w, x, y, z = q
+
+    r = R.from_quat([
+        x,
+        y,
+        z,
+        w
+    ])
+
+    rotvec = np.degrees(r.as_rotvec())
+
+    return rotvec[0], rotvec[1], rotvec[2]
+
+def angle_diff(a, b):
+
+    d = a - b
+
+    while d > 180:
+        d -= 360
+
+    while d < -180:
+        d += 360
+
+    return d
+
+
+# ==========================================
+# ORIENTATION DIAGNOSTIC HELPERS
+# ==========================================
+
+def quat_rel_rpy(q_ref_wxyz, q_curr_wxyz):
+    """
+    Compute relative RPY (degrees) from q_ref to q_curr.
+    Both quaternions use internal [w, x, y, z] convention.
+
+    Returns (roll_deg, pitch_deg, yaw_deg) representing the rotation
+    you would need to apply ON TOP OF q_ref to reach q_curr.
+
+    This is the correct single-step orientation pipeline:
+        q_rel = conj(q_ref) * q_curr
+        RPY   = quat_to_rpy(q_rel)
+    No accumulation. No gains. No intermediate Euler.
+    """
+    q_rel = quat_multiply(quat_conjugate(q_ref_wxyz), q_curr_wxyz)
+    q_rel = normalize_quat(q_rel)
+    # Keep on the same hemisphere as identity [1,0,0,0] to avoid sign jumps
+    if q_rel[0] < 0:
+        q_rel = -q_rel
+    roll_d, pitch_d, yaw_d = quat_to_rpy(q_rel)
+    return roll_d, pitch_d, yaw_d
+
+
+def print_orientation_diagnostics(label, q_ref_wxyz, q_curr_wxyz):
+    """
+    Print a full orientation diagnostic block.
+    Call this inside the trajectory loop for selected samples.
+    """
+    q_curr = normalize_quat(q_curr_wxyz)
+    q_rel  = normalize_quat(quat_multiply(quat_conjugate(q_ref_wxyz), q_curr))
+    if q_rel[0] < 0:
+        q_rel = -q_rel
+    angle_deg = 2.0 * np.degrees(np.arccos(np.clip(q_rel[0], -1.0, 1.0)))
+    roll_d, pitch_d, yaw_d = quat_to_rpy(q_rel)
+    rv_x, rv_y, rv_z = quat_to_rotvec_degrees(q_rel)
+
+    print(f"[ORIENT DIAG] {label}")
+    print(
+        f"  RAW Q      : w={q_curr[0]:.4f} x={q_curr[1]:.4f} "
+        f"y={q_curr[2]:.4f} z={q_curr[3]:.4f}"
+    )
+    print(
+        f"  NORMALIZED : w={q_curr[0]:.4f} x={q_curr[1]:.4f} "
+        f"y={q_curr[2]:.4f} z={q_curr[3]:.4f}"
+    )
+    print(
+        f"  DELTA Q    : w={q_rel[0]:.4f} x={q_rel[1]:.4f} "
+        f"y={q_rel[2]:.4f} z={q_rel[3]:.4f}"
+    )
+    print(f"  ANGLE DEG  : {angle_deg:.2f}")
+    print(
+        f"  DELTA RPY  : roll={roll_d:.2f}  pitch={pitch_d:.2f}  yaw={yaw_d:.2f}"
+    )
+    print(f"  ROTVEC     : x={rv_x:.2f}  y={rv_y:.2f}  z={rv_z:.2f}")
+
+
+def run_axis_test(q_array_wxyz, axis_name, expected_robot_axis):
+    """
+    Axis-test utility: scans the quaternion array for the sample with the
+    largest rotation around a specific tracker axis, then reports what the
+    robot output would be for that sample.
+
+    Parameters
+    ----------
+    q_array_wxyz  : Nx4 array, internal [w,x,y,z] convention
+    axis_name     : 'ROLL' | 'PITCH' | 'YAW'  (tracker axis label)
+    expected_robot_axis : string describing expected robot axis (for display)
+
+    Usage in console / notebook:
+        run_axis_test(q_array, 'YAW', 'robot Yaw')
+    """
+    q_ref = normalize_quat(q_array_wxyz[0])
+    max_angle = 0.0
+    max_idx   = 0
+
+    for i in range(len(q_array_wxyz)):
+        q = normalize_quat(q_array_wxyz[i])
+        q_rel = normalize_quat(quat_multiply(quat_conjugate(q_ref), q))
+        if q_rel[0] < 0:
+            q_rel = -q_rel
+        ang = 2.0 * np.degrees(np.arccos(np.clip(q_rel[0], -1.0, 1.0)))
+        if ang > max_angle:
+            max_angle = ang
+            max_idx   = i
+
+    q_peak = normalize_quat(q_array_wxyz[max_idx])
+    q_rel_peak = normalize_quat(quat_multiply(quat_conjugate(q_ref), q_peak))
+    if q_rel_peak[0] < 0:
+        q_rel_peak = -q_rel_peak
+
+    roll_d, pitch_d, yaw_d = quat_to_rpy(q_rel_peak)
+    rv_x, rv_y, rv_z = quat_to_rotvec_degrees(q_rel_peak)
+
+    print(f"\n[AXIS TEST] Tracker motion: {axis_name}")
+    print(f"  Peak rotation angle : {max_angle:.1f} deg  (at sample {max_idx})")
+    print(f"  Expected robot axis : {expected_robot_axis}")
+    print(
+        f"  Delta Q at peak    : w={q_rel_peak[0]:.4f} x={q_rel_peak[1]:.4f} "
+        f"y={q_rel_peak[2]:.4f} z={q_rel_peak[3]:.4f}"
+    )
+    print(f"  Rotvec tracker     : x={rv_x:.2f}  y={rv_y:.2f}  z={rv_z:.2f}")
+    print(
+        f"  Robot output RPY   : roll={roll_d:.2f}  pitch={pitch_d:.2f}  yaw={yaw_d:.2f}"
+    )
+    print(
+        f"  Tracker motion detected: {axis_name} {max_angle:+.1f}°  →  "
+        f"Roll={roll_d:.1f}°  Pitch={pitch_d:.1f}°  Yaw={yaw_d:.1f}°"
+    )
+
 # ==========================================
 # FIND BAD TRACKER JUMPS
 # ==========================================
@@ -307,6 +519,78 @@ all_pitch = []
 all_yaw = []
 
 # ==========================================
+# FAIRINO IK ANALYSIS — INITIALISATION
+# ==========================================
+# This block runs before the write loop.
+# It connects to the robot, fetches real joint soft-limits, and
+# prepares all accumulators.  The trajectory write loop is NOT
+# changed; analysis hooks are injected inside it below.
+# ==========================================
+
+# ── Joint limit thresholds (degrees) ──────────────────────────────────────────
+IK_MARGIN_SAFE      = 60.0    # green  — comfortable
+IK_MARGIN_WARNING   = 30.0    # amber  — monitor
+IK_MARGIN_DANGEROUS = 10.0    # red    — must fix before deployment
+# below IK_MARGIN_DANGEROUS → REJECT
+
+# ── SDK connection ─────────────────────────────────────────────────────────────
+_robot          = None   # Robot.RPC instance (None when IK disabled / failed)
+_joint_limits   = None   # [[lo, hi], …] for J1..J6, fetched from controller
+
+if ENABLE_IK_ANALYSIS:
+    try:
+        from fairino import Robot as _FairinoRobot
+        
+
+        print(f"\nConnecting to FAIRINO controller at {ROBOT_IP} for IK analysis…")
+        _robot = _FairinoRobot.RPC(ROBOT_IP)
+
+        # ── Fetch real joint soft limits from the controller ───────────────────
+        # GetJointSoftLimitDeg(flag=1)
+        #   Returns: (error, [j1min, j1max, j2min, j2max, j3min, j3max,
+        #                      j4min, j4max, j5min, j5max, j6min, j6max])
+        #   Units: degrees
+        _err_lim, _raw_limits = _robot.GetJointSoftLimitDeg(1)
+
+        if _err_lim == 0 and _raw_limits is not None:
+            # Reshape flat list into [[lo, hi], …] per joint
+            _joint_limits = [
+                [_raw_limits[2 * j], _raw_limits[2 * j + 1]]
+                for j in range(6)
+            ]
+            print("Joint soft limits fetched from controller (degrees):")
+            for _j, (_lo, _hi) in enumerate(_joint_limits):
+                print(f"  J{_j+1}: [{_lo:.1f}, {_hi:.1f}]")
+        else:
+            print(f"WARNING: GetJointSoftLimitDeg failed (error={_err_lim}). "
+                  "IK margin analysis will be skipped.")
+            _robot = None   # disable IK analysis gracefully
+
+    except Exception as _e:
+        print(f"WARNING: Could not connect to FAIRINO controller ({_e}). "
+              "IK analysis disabled; trajectory file will be written unchanged.")
+        _robot = None
+
+# ── Per-trajectory accumulators ────────────────────────────────────────────────
+_ik_previous_joints = list(IK_SEED_JOINTS)   # seed for first GetInverseKinRef call
+_ik_failure_list    = []                       # [(waypoint_index, pose), …]
+_ik_all_joints      = []                       # [(waypoint_index, joints), …] — successes only
+_unsafe_waypoints = []
+# Per-joint running min/max   — indexed 0..5
+_ik_joint_min = [ float("inf")] * 6
+_ik_joint_max = [float("-inf")] * 6
+
+# Worst-margin tracking
+_ik_worst_margin     = float("inf")
+_ik_worst_wp_index   = -1
+_ik_worst_joint_idx  = -1          # 0-based joint number
+_ik_worst_pose       = None
+_ik_worst_joints     = None
+
+# Waypoint counter shared with the analysis (mirrors `count` inside the loop)
+_ik_waypoint_index   = 0           # incremented once per substep written
+
+# ==========================================
 # SAVE FAIRINO FILE
 # ==========================================
 
@@ -361,12 +645,14 @@ with open(OUTPUT_FILE, "w") as f:
     last_px = START_X
     last_py = START_Y
     last_pz = START_Z
-    prev_droll = None
-    prev_dpitch = None
-    prev_dyaw = None
+    prev_q_current = None
+    prev_q_rel = None
+    orient_roll = 0.0
+    orient_pitch = 0.0
+    orient_yaw = 0.0
     for i in range(STEP, len(robot_x), STEP):
 
-        SKIP_RADIUS = 5
+        SKIP_RADIUS = 0
 
         skip_point = False
 
@@ -398,41 +684,82 @@ with open(OUTPUT_FILE, "w") as f:
             qy[i],
             qz[i]
         ])
+        q_current = normalize_quat(q_current)
+        q_current = keep_quat_same_hemisphere(
+            q_current,
+            prev_q_current
+        )
+        prev_q_current = q_current.copy()
+
+        # ── ORIENTATION PIPELINE (corrected) ──────────────────────────────────
+        #
+        # Previous code computed q_rel = conj(q0)*q_curr (correct),
+        # then extracted a SECOND step-delta from adjacent q_rel values,
+        # converted that step-delta to a rotvec, and ACCUMULATED the rotvec
+        # components. This double-differencing + re-integration drifts when
+        # rotations occur around more than one axis simultaneously.
+        #
+        # Fix: q_rel already IS the total rotation from the reference pose.
+        # Convert q_rel directly to RPY. No accumulation needed.
+        #
+        # All three variables below (orient_roll/pitch/yaw) and the prev_q_rel
+        # bookkeeping are now unused. They are left initialised above to avoid
+        # any NameError in code paths not shown here, but play no role.
+        # ──────────────────────────────────────────────────────────────────────
 
         q_rel = quat_multiply(
             quat_conjugate(q0),
             q_current
         )
-        q_rel = q_rel / np.linalg.norm(q_rel)
-        if count < 10:
+        q_rel = normalize_quat(q_rel)
+
+        # Keep q_rel on positive-w hemisphere for numerical stability
+        if q_rel[0] < 0:
+            q_rel = -q_rel
+
+        # Extract RPY directly from q_rel (no gains, no accumulated drift)
+        droll, dpitch, dyaw = quat_to_rpy(q_rel)
+
+        # ── Orientation diagnostics (printed for first 5 samples and every 50th) ──
+        if count <= 5 or count % 50 == 0:
+            rel_angle_deg = 2.0 * np.degrees(
+                np.arccos(np.clip(q_rel[0], -1.0, 1.0))
+            )
+            rv_x, rv_y, rv_z = quat_to_rotvec_degrees(q_rel)
             print(
-                f"QREL "
-                f"{q_rel[0]:.4f} "
-                f"{q_rel[1]:.4f} "
-                f"{q_rel[2]:.4f} "
-                f"{q_rel[3]:.4f}"
+                f"[ORIENT] sample={count}  "
+                f"RAW Q: w={q_current[0]:.4f} x={q_current[1]:.4f} "
+                f"y={q_current[2]:.4f} z={q_current[3]:.4f}"
+            )
+            print(
+                f"         DELTA Q: w={q_rel[0]:.4f} x={q_rel[1]:.4f} "
+                f"y={q_rel[2]:.4f} z={q_rel[3]:.4f}  "
+                f"ANGLE DEG: {rel_angle_deg:.2f}"
+            )
+            print(
+                f"         Robot output: roll={droll:.2f}  "
+                f"pitch={dpitch:.2f}  yaw={dyaw:.2f}"
             )
 
-        droll, dpitch, dyaw = quat_to_rpy(q_rel)
-        droll  = unwrap_angle(prev_droll, droll)
-        dpitch = unwrap_angle(prev_dpitch, dpitch)
-        dyaw   = unwrap_angle(prev_dyaw, dyaw)
+        debug_mode = (
+            DEBUG_START <= count <= DEBUG_END
+        )
 
-        prev_droll  = droll
-        prev_dpitch = dpitch
-        prev_dyaw   = dyaw
-
-        ROLL_GAIN = 0.3
-        PITCH_GAIN = 0.3
-        YAW_GAIN = 0.3
+        ROLL_GAIN  = 1.0   # no artificial attenuation: q_rel is already relative
+        PITCH_GAIN = 1.0
+        YAW_GAIN   = 1.0
 
         pr   = START_ROLL  + droll  * ROLL_GAIN
         pp   = START_PITCH + dpitch * PITCH_GAIN
         pyaw = START_YAW   + dyaw   * YAW_GAIN
 
-        #pr   = wrap_angle(pr)
-        #pp   = wrap_angle(pp)
-        #pyaw = wrap_angle(pyaw)
+            #pr   = wrap_angle(pr)
+            #pp   = wrap_angle(pp)
+            #pyaw = wrap_angle(pyaw)
+        start_pr = pr if prev_pr is None else prev_pr
+        start_pp = pp if prev_pp is None else prev_pp
+        start_pyaw = pyaw if prev_pyaw is None else prev_pyaw
+
         if prev_pr is None:
 
             roll_step = 0
@@ -457,10 +784,24 @@ with open(OUTPUT_FILE, "w") as f:
                 max_yaw_step = yaw_step
                 max_yaw_index = count
 
-        print(
-            f"STEP R={roll_step:.2f} "
-            f"P={pitch_step:.2f} "
-            f"Y={yaw_step:.2f}"
+            #print(
+               # f"STEP R={roll_step:.2f} "
+                #f"P={pitch_step:.2f} "
+                #f"Y={yaw_step:.2f}"
+            #)
+
+        segment_steps = max(
+            1,
+            int(
+                np.ceil(
+                    max(
+                        roll_step,
+                        pitch_step,
+                        yaw_step,
+                    )
+                    / MAX_ROBOT_ORIENTATION_STEP
+                )
+            )
         )
 
         prev_pr = pr
@@ -475,98 +816,258 @@ with open(OUTPUT_FILE, "w") as f:
         dy = abs(py - last_py)
         dz = abs(pz - last_pz)
 
-        
+        if debug_mode:
+            print(
+                f"{count:03d}: "
+                f"{px:.3f} "
+                f"{py:.3f} "
+                f"{pz:.3f}"
+            )
 
-        print(
-            f"{count:03d}: "
-            f"{px:.3f} "
-            f"{py:.3f} "
-            f"{pz:.3f}"
+        if debug_mode:
+            print(
+                f"dRoll={droll:.1f} "
+                f"dPitch={dpitch:.1f} "
+                f"dYaw={dyaw:.1f}"
+            )
+
+        angle = 2 * np.degrees(
+            np.arccos(
+                np.clip(q_rel[0], -1.0, 1.0)
+            )
         )
 
-        print(
-            f"dRoll={droll:.1f} "
-            f"dPitch={dpitch:.1f} "
-            f"dYaw={dyaw:.1f}"
-        )
+        if debug_mode:
+            print(f"QANGLE={angle:.1f}")
 
-        
+        for substep in range(1, segment_steps + 1):
 
-        f.write(
-            f"{px:.3f} "
-            f"{py:.3f} "
-            f"{pz:.3f} "
-            f"{pr:.3f} "
-            f"{pp:.3f} "
-            f"{pyaw:.3f}\n"
-        )
+            alpha = substep / segment_steps
+
+            out_x   = last_px   + (px   - last_px)   * alpha
+            out_y   = last_py   + (py   - last_py)   * alpha
+            out_z   = last_pz   + (pz   - last_pz)   * alpha
+            out_r   = start_pr  + (pr   - start_pr)  * alpha
+            out_p   = start_pp  + (pp   - start_pp)  * alpha
+            out_yaw = start_pyaw + (pyaw - start_pyaw) * alpha
+
+            # ── FAIRINO IK ANALYSIS HOOK ───────────────────────────────────────
+            # Runs only when a live controller is available.
+            # Does NOT alter out_x/y/z/r/p/yaw or the file output in any way.
+            if _robot is not None and _joint_limits is not None:
+
+                _ik_waypoint_index += 1
+                _pose = [out_x, out_y, out_z, out_r, out_p, out_yaw]
+
+                # GetInverseKinRef(type, desc_pos, joint_pos_ref)
+                #   type=0  → absolute pose in base frame
+                #   joint_pos_ref → previous solution keeps trajectory continuous
+                _ik_err, _ik_joints = _robot.GetInverseKinRef(
+                    0,
+                    _pose,
+                    _ik_previous_joints,
+                )
+
+                if _ik_err != 0 or _ik_joints is None:
+                    # Record failure; do not crash; keep previous seed unchanged
+                    _ik_failure_list.append((_ik_waypoint_index, list(_pose)))
+                else:
+                    # IK succeeded — update seed for next call
+                    _ik_previous_joints = list(_ik_joints)
+                    _ik_all_joints.append((_ik_waypoint_index, list(_ik_joints)))
+
+                    # ── Update per-joint running min/max ──────────────────────
+                    for _j in range(6):
+                        if _ik_joints[_j] < _ik_joint_min[_j]:
+                            _ik_joint_min[_j] = _ik_joints[_j]
+                        if _ik_joints[_j] > _ik_joint_max[_j]:
+                            _ik_joint_max[_j] = _ik_joints[_j]
+
+                    # ── Compute margin for every joint at this waypoint ────────
+                    # margin = distance to the nearer soft-limit boundary
+                    _wp_margins = []
+                    for _j in range(6):
+                        _lo, _hi = _joint_limits[_j]
+                        _margin_lo = _ik_joints[_j] - _lo
+                        _margin_hi = _hi - _ik_joints[_j]
+                        _wp_margins.append(min(_margin_lo, _margin_hi))
+
+                    _wp_min_margin = min(_wp_margins)
+                    if _wp_min_margin < IK_MARGIN_DANGEROUS:
+
+                        _unsafe_waypoints.append(
+                            (
+                                _ik_waypoint_index,
+                                _wp_min_margin,
+                                list(_pose)
+                            )
+                        )
+
+                    # ── Track globally worst margin ────────────────────────────
+                    if _wp_min_margin < _ik_worst_margin:
+                        _ik_worst_margin    = _wp_min_margin
+                        _ik_worst_wp_index  = _ik_waypoint_index
+                        _ik_worst_joint_idx = _wp_margins.index(_wp_min_margin)
+                        _ik_worst_pose      = list(_pose)
+                        _ik_worst_joints    = list(_ik_joints)
+            # ── END IK ANALYSIS HOOK ──────────────────────────────────────────
+
+            f.write(
+                f"{out_x:.3f} "
+                f"{out_y:.3f} "
+                f"{out_z:.3f} "
+                f"{out_r:.3f} "
+                f"{out_p:.3f} "
+                f"{out_yaw:.3f}\n"
+            )
 
         last_px = px
         last_py = py
         last_pz = pz
 
         count += 1
-print("\nOrientation Range")
-print("Roll :", min(all_roll), max(all_roll))
-print("Pitch:", min(all_pitch), max(all_pitch))
-print("Yaw  :", min(all_yaw), max(all_yaw))
 
-print("len(robot_x) =", len(robot_x))
-print("STEP =", STEP)
-print("Expected points =", len(range(0, len(robot_x), STEP)))
+# ==========================================
+# ORIENTATION AXIS TESTS
+# ==========================================
+# Build the quaternion array in internal [w,x,y,z] convention for the tests.
+# These functions show which tracker axis drives which robot axis,
+# so you can verify and add a frame-mapping transform when needed.
+# ==========================================
 
-print("\nPoints written =", count)
-print("Points skipped =", skipped)
-print("\nMaximum Orientation Step")
-print(f"Roll  = {max_roll_step:.2f}")
-print(f"Pitch = {max_pitch_step:.2f}")
-print(f"Yaw   = {max_yaw_step:.2f}")
-print(f"Roll Point  = {max_roll_index}")
-print(f"Pitch Point = {max_pitch_index}")
-print(f"Yaw Point   = {max_yaw_index}")
-print(f"\nSaved: {OUTPUT_FILE}")
+_q_all = np.column_stack([qw, qx, qy, qz])   # shape (N, 4), internal [w,x,y,z]
 
-print("\nFirst generated pose")
+print("\n" + "=" * 60)
+print("ORIENTATION AXIS TEST SUMMARY")
+print("=" * 60)
+print("(Shows which tracker rotation produces which robot RPY delta)")
+print("(Run with a dataset where you rotate the tracker one axis at a time)")
+run_axis_test(_q_all, 'ROLL  (tracker X-axis rotation)',  'robot Roll?')
+run_axis_test(_q_all, 'PITCH (tracker Y-axis rotation)', 'robot Pitch?')
+run_axis_test(_q_all, 'YAW   (tracker Z-axis rotation)',  'robot Yaw?')
+print("=" * 60)
 
-print(
-    f"{robot_x[0]:.3f} "
-    f"{robot_y[0]:.3f} "
-    f"{robot_z[0]:.3f} "
-    f"{roll[0]:.3f} "
-    f"{pitch[0]:.3f} "
-    f"{yaw[0]:.3f}"
-)
+# ==========================================
+# FAIRINO IK ANALYSIS — END-OF-RUN REPORT
+# ==========================================
+# Printed after fairino_path.txt is fully written and closed.
+# The file on disk is identical regardless of whether this block runs.
+# ==========================================
 
-print(
-    "\nFile size:",
-    os.path.getsize(OUTPUT_FILE),
-    "bytes"
-)
+if _robot is not None and _joint_limits is not None:
 
-print("\nRobot trajectory span")
+    _total_waypoints = _ik_waypoint_index
+    _ik_failure_count = len(_ik_failure_list)
+    _ik_success_count = len(_ik_all_joints)
 
-print(
-    f"X span = {robot_x.max()-robot_x.min():.1f}"
-)
+    # ── Determine overall classification ──────────────────────────────────────
+    if _ik_worst_margin == float("inf"):
+        # No successful IK at all
+        _classification = "NO DATA"
+    elif _ik_worst_margin > IK_MARGIN_SAFE:
+        _classification = "SAFE"
+    elif _ik_worst_margin > IK_MARGIN_WARNING:
+        _classification = "WARNING"
+    elif _ik_worst_margin > IK_MARGIN_DANGEROUS:
+        _classification = "DANGEROUS"
+    else:
+        _classification = "REJECT"
 
-print(
-    f"Y span = {robot_y.max()-robot_y.min():.1f}"
-)
+    print("\n" + "=" * 60)
+    print("TRAJECTORY JOINT ANALYSIS")
+    print("=" * 60)
 
-print(
-    f"Z span = {robot_z.max()-robot_z.min():.1f}"
-)
+    print(f"\nTotal Waypoints  : {_total_waypoints}")
+    print(f"IK Successes     : {_ik_success_count}")
+    print(f"IK Failures      : {_ik_failure_count}")
 
-print("Roll :", roll.min(), roll.max())
-print("Pitch:", pitch.min(), pitch.max())
-print("Yaw  :", yaw.min(), yaw.max())
+    if _ik_failure_count > 0:
+        print("\nFailed Waypoints (index, pose):")
+        for _wp_i, _wp_pose in _ik_failure_list:
+            _xf, _yf, _zf, _rf, _pf, _yf2 = _wp_pose
+            print(
+                f"  WP {_wp_i:05d}: "
+                f"X={_xf:.2f} Y={_yf:.2f} Z={_zf:.2f} "
+                f"R={_rf:.2f} P={_pf:.2f} Yaw={_yf2:.2f}"
+            )
 
-print("\nReference Offsets")
-print(f"tracker_x0 = {tracker_x0:.1f}")
-print(f"tracker_y0 = {tracker_y0:.1f}")
-print(f"tracker_z0 = {tracker_z0:.1f}")
+    print("\nJoint Ranges (degrees):")
+    print(f"  {'Joint':<6} {'Min':>10} {'Max':>10}  {'Soft Lo':>10} {'Soft Hi':>10}")
+    for _j in range(6):
+        _lo, _hi = _joint_limits[_j]
+        _jmin = _ik_joint_min[_j] if _ik_joint_min[_j] != float("inf") else float("nan")
+        _jmax = _ik_joint_max[_j] if _ik_joint_max[_j] != float("-inf") else float("nan")
+        print(
+            f"  J{_j+1:<5} "
+            f"{_jmin:>10.2f} "
+            f"{_jmax:>10.2f}  "
+            f"{_lo:>10.2f} "
+            f"{_hi:>10.2f}"
+        )
+    print("\nJoint Usage:")
 
-print(f"tracker_x_median = {np.median(x):.1f}")
-print(f"tracker_y_median = {np.median(y):.1f}")
-print(f"tracker_z_median = {np.median(z):.1f}")
+    for _j in range(6):
 
+        _lo, _hi = _joint_limits[_j]
+
+        _jmin = _ik_joint_min[_j]
+        _jmax = _ik_joint_max[_j]
+
+        if (
+            _jmin == float("inf")
+            or _jmax == float("-inf")
+        ):
+            continue
+
+        _used_range = _jmax - _jmin
+        _full_range = _hi - _lo
+
+        _usage_pct = 100.0 * _used_range / _full_range
+
+        print(
+            f"  J{_j+1}: {_usage_pct:.1f}%"
+        )
+
+    if _ik_worst_joints is not None:
+        print(f"\nWorst Margin:")
+        print(f"  Joint         : J{_ik_worst_joint_idx + 1}")
+        print(f"  Margin        : {_ik_worst_margin:.2f} deg")
+        print(f"  Waypoint Index: {_ik_worst_wp_index}")
+        _wx, _wy, _wz, _wr, _wp2, _wy2 = _ik_worst_pose
+        print(
+            f"  Cartesian Pose: "
+            f"X={_wx:.3f} Y={_wy:.3f} Z={_wz:.3f} "
+            f"Roll={_wr:.3f} Pitch={_wp2:.3f} Yaw={_wy2:.3f}"
+        )
+        _j_vals = "  ".join(f"J{_j+1}={_ik_worst_joints[_j]:.2f}" for _j in range(6))
+        print(f"  Joint Values  : {_j_vals}")
+    else:
+        print("\nWorst Margin: no successful IK solutions to report.")
+
+    print(f"\nOverall Classification: {_classification}")
+    print(
+        f"\nUnsafe Waypoints: "
+        f"{len(_unsafe_waypoints)}"
+    )
+
+    if len(_unsafe_waypoints) > 0:
+
+        print("\nFirst Unsafe Waypoints:")
+
+        for _wp, _margin, _pose in _unsafe_waypoints[:10]:
+
+            print(
+                f"  WP {_wp} "
+                f"Margin={_margin:.2f}"
+            )
+    print(
+        "  SAFE (>60°)  WARNING (30–60°)  DANGEROUS (10–30°)  REJECT (<10°)"
+    )
+
+    print("\n" + "=" * 60)
+
+elif ENABLE_IK_ANALYSIS:
+    # ENABLE_IK_ANALYSIS was True but connection failed at startup
+    print("\n[IK ANALYSIS] Skipped — controller not reachable at startup.")
+else:
+    print("\n[IK ANALYSIS] Disabled (ENABLE_IK_ANALYSIS = False).")

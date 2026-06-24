@@ -55,6 +55,12 @@ last_roll = None
 last_pitch = None
 last_yaw = None
 
+# ── Orientation reference (set on first accepted sample in recording loop) ────
+q_ref_w = None
+q_ref_x = None
+q_ref_y = None
+q_ref_z = None
+
 os.makedirs(os.path.dirname(csv_file), exist_ok=True)
 
 with open(csv_file, "w", newline="") as f:
@@ -65,16 +71,22 @@ with open(csv_file, "w", newline="") as f:
         "x",
         "y",
         "z",
-        "qw",
+        "tracker_x0",
+        "tracker_y0",
+        "tracker_z0",
+        # survive-cli --record-stdout emits:  tx ty tz  qx qy qz qw  (scalar LAST)
+        # parts[6]=qx  parts[7]=qy  parts[8]=qz  parts[9]=qw
+        # Labels corrected to match actual field positions.
         "qx",
         "qy",
         "qz",
+        "qw",
         "raw_roll",
         "raw_pitch",
         "raw_yaw",
         "unwrapped_roll",
         "unwrapped_pitch",
-        "unwrapped_yaw",
+        "unwrapped_yaw", 
     ])
 
 cmd = [
@@ -159,10 +171,76 @@ for line in proc.stdout:
             )
             continue
 
-        qw = float(parts[6])
-        qx = float(parts[7])
-        qy = float(parts[8])
-        qz = float(parts[9])
+        # survive-cli --record-stdout field order (verified against libsurvive source):
+        #   parts[0]=time  parts[1]="POSE"  parts[2]=tag
+        #   parts[3]=tx    parts[4]=ty      parts[5]=tz
+        #   parts[6]=qx    parts[7]=qy      parts[8]=qz    parts[9]=qw   (scalar LAST)
+        #
+        # Previous logger had these labelled qw/qx/qy/qz (shifted by one).
+        # Corrected below.  Internal convention kept as [w, x, y, z] for all
+        # downstream math (same as before) — only the parse assignment changed.
+        qx = float(parts[6])   # was incorrectly labelled qw
+        qy = float(parts[7])   # was incorrectly labelled qx
+        qz = float(parts[8])   # was incorrectly labelled qy
+        qw = float(parts[9])   # was incorrectly labelled qz
+
+        q_norm_val = math.sqrt(qw*qw + qx*qx + qy*qy + qz*qz)
+
+        print(
+            f"RAW QUAT: qx={parts[6]} qy={parts[7]} qz={parts[8]} qw={parts[9]}"
+        )
+        print(f"Q NORM = {q_norm_val:.4f}")
+
+        # Normalise
+        if q_norm_val < 1e-6:
+            print("DEGENERATE QUATERNION — skipping")
+            continue
+        qw /= q_norm_val
+        qx /= q_norm_val
+        qy /= q_norm_val
+        qz /= q_norm_val
+
+        # ── Orientation reference: capture on first accepted sample ──────────
+        # q_ref is the tracker orientation at the start of recording.
+        # All subsequent orientations are expressed as rotations RELATIVE to
+        # this reference, so the robot returns to its neutral pose when the
+        # tracker returns to its start position.
+        if q_ref_w is None:
+            q_ref_w = qw
+            q_ref_x = qx
+            q_ref_y = qy
+            q_ref_z = qz
+            print(
+                f"ORIENTATION REFERENCE SET: "
+                f"qw={q_ref_w:.6f} qx={q_ref_x:.6f} "
+                f"qy={q_ref_y:.6f} qz={q_ref_z:.6f}"
+            )
+
+        # ── Relative quaternion: q_rel = conj(q_ref) * q_current ─────────────
+        # conj(q_ref) = [q_ref_w, -q_ref_x, -q_ref_y, -q_ref_z]
+        # Product using Hamilton product (internal [w,x,y,z] convention):
+        aw, ax, ay, az = q_ref_w, -q_ref_x, -q_ref_y, -q_ref_z  # conj(q_ref)
+        bw, bx, by, bz = qw, qx, qy, qz
+        rel_w = aw*bw - ax*bx - ay*by - az*bz
+        rel_x = aw*bx + ax*bw + ay*bz - az*by
+        rel_y = aw*by - ax*bz + ay*bw + az*bx
+        rel_z = aw*bz + ax*by - ay*bx + az*bw
+        # Normalise
+        rel_norm = math.sqrt(rel_w**2 + rel_x**2 + rel_y**2 + rel_z**2)
+        if rel_norm > 1e-6:
+            rel_w /= rel_norm; rel_x /= rel_norm
+            rel_y /= rel_norm; rel_z /= rel_norm
+        # Rotation angle magnitude of q_rel
+        rel_angle_deg = 2.0 * math.degrees(math.acos(max(-1.0, min(1.0, rel_w))))
+
+        print(
+            f"NORMALIZED Q: qw={qw:.6f} qx={qx:.6f} qy={qy:.6f} qz={qz:.6f}"
+        )
+        print(
+            f"DELTA Q: qw={rel_w:.6f} qx={rel_x:.6f} "
+            f"qy={rel_y:.6f} qz={rel_z:.6f}"
+        )
+        print(f"ANGLE DEG: {rel_angle_deg:.2f}")
 
         raw_roll, raw_pitch, raw_yaw = quat_to_rpy(
             qw, qx, qy, qz
@@ -239,9 +317,20 @@ for line in proc.stdout:
         reject_z = None
         stable_rejects = 0
 
-        unwrapped_roll = unwrap_angle(last_roll, raw_roll)
-        unwrapped_pitch = unwrap_angle(last_pitch, raw_pitch)
-        unwrapped_yaw = unwrap_angle(last_yaw, raw_yaw)
+        unwrapped_roll = unwrap_angle(
+            last_roll,
+            raw_roll
+        )
+
+        unwrapped_pitch = unwrap_angle(
+            last_pitch,
+            raw_pitch
+        )
+
+        unwrapped_yaw = unwrap_angle(
+            last_yaw,
+            raw_yaw
+        )
 
         last_roll = unwrapped_roll
         last_pitch = unwrapped_pitch
@@ -262,6 +351,14 @@ for line in proc.stdout:
         )
 
         print(
+            f"Q = "
+            f"{qw:.6f} "
+            f"{qx:.6f} "
+            f"{qy:.6f} "
+            f"{qz:.6f}"
+        )
+
+        print(
             f"UNWRAPPED RPY "
             f"R={unwrapped_roll:.1f} "
             f"P={unwrapped_pitch:.1f} "
@@ -276,10 +373,14 @@ for line in proc.stdout:
                 x,
                 y,
                 z,
-                qw,
+                tracker_x0 / 1000.0,
+                tracker_y0 / 1000.0,
+                tracker_z0 / 1000.0,
+                # Corrected order: qx qy qz qw (scalar-last, matching header)
                 qx,
                 qy,
                 qz,
+                qw,
                 raw_roll,
                 raw_pitch,
                 raw_yaw,
@@ -292,4 +393,3 @@ for line in proc.stdout:
 
     except Exception as e:
         print("Parse Error:", e)
-
