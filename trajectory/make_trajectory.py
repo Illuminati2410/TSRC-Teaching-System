@@ -10,6 +10,7 @@ from fairino import Robot
 import pandas as pd
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+import os
 
 # ==========================================
 # FAIRINO IK ANALYSIS — OPTIONAL MODULE
@@ -107,9 +108,6 @@ def keep_quat_same_hemisphere(q, previous_q):
         return -q
 
     return q
-
-
-
 # ==========================================
 # LOAD DATA
 # ==========================================
@@ -136,17 +134,10 @@ if missing_columns:
 
 if df.empty:
     raise ValueError("tracker_data.csv has no samples")
-qx_col = df["qx"].to_numpy()   # survive field qx (scalar-last convention in CSV)
-qy_col = df["qy"].to_numpy()
-qz_col = df["qz"].to_numpy()
-qw_col = df["qw"].to_numpy()   # survive field qw
-
-# Internal convention throughout make_trajectory is [w, x, y, z] (scalar-first).
-# Map CSV columns → internal arrays.
-qw = qw_col
-qx = qx_col
-qy = qy_col
-qz = qz_col
+qw = df["qw"].to_numpy()
+qx = df["qx"].to_numpy()
+qy = df["qy"].to_numpy()
+qz = df["qz"].to_numpy()
 q0 = np.array([
     qw[0],
     qx[0],
@@ -223,119 +214,6 @@ def angle_diff(a, b):
         d += 360
 
     return d
-
-
-# ==========================================
-# ORIENTATION DIAGNOSTIC HELPERS
-# ==========================================
-
-def quat_rel_rpy(q_ref_wxyz, q_curr_wxyz):
-    """
-    Compute relative RPY (degrees) from q_ref to q_curr.
-    Both quaternions use internal [w, x, y, z] convention.
-
-    Returns (roll_deg, pitch_deg, yaw_deg) representing the rotation
-    you would need to apply ON TOP OF q_ref to reach q_curr.
-
-    This is the correct single-step orientation pipeline:
-        q_rel = conj(q_ref) * q_curr
-        RPY   = quat_to_rpy(q_rel)
-    No accumulation. No gains. No intermediate Euler.
-    """
-    q_rel = quat_multiply(quat_conjugate(q_ref_wxyz), q_curr_wxyz)
-    q_rel = normalize_quat(q_rel)
-    # Keep on the same hemisphere as identity [1,0,0,0] to avoid sign jumps
-    if q_rel[0] < 0:
-        q_rel = -q_rel
-    roll_d, pitch_d, yaw_d = quat_to_rpy(q_rel)
-    return roll_d, pitch_d, yaw_d
-
-
-def print_orientation_diagnostics(label, q_ref_wxyz, q_curr_wxyz):
-    """
-    Print a full orientation diagnostic block.
-    Call this inside the trajectory loop for selected samples.
-    """
-    q_curr = normalize_quat(q_curr_wxyz)
-    q_rel  = normalize_quat(quat_multiply(quat_conjugate(q_ref_wxyz), q_curr))
-    if q_rel[0] < 0:
-        q_rel = -q_rel
-    angle_deg = 2.0 * np.degrees(np.arccos(np.clip(q_rel[0], -1.0, 1.0)))
-    roll_d, pitch_d, yaw_d = quat_to_rpy(q_rel)
-    rv_x, rv_y, rv_z = quat_to_rotvec_degrees(q_rel)
-
-    print(f"[ORIENT DIAG] {label}")
-    print(
-        f"  RAW Q      : w={q_curr[0]:.4f} x={q_curr[1]:.4f} "
-        f"y={q_curr[2]:.4f} z={q_curr[3]:.4f}"
-    )
-    print(
-        f"  NORMALIZED : w={q_curr[0]:.4f} x={q_curr[1]:.4f} "
-        f"y={q_curr[2]:.4f} z={q_curr[3]:.4f}"
-    )
-    print(
-        f"  DELTA Q    : w={q_rel[0]:.4f} x={q_rel[1]:.4f} "
-        f"y={q_rel[2]:.4f} z={q_rel[3]:.4f}"
-    )
-    print(f"  ANGLE DEG  : {angle_deg:.2f}")
-    print(
-        f"  DELTA RPY  : roll={roll_d:.2f}  pitch={pitch_d:.2f}  yaw={yaw_d:.2f}"
-    )
-    print(f"  ROTVEC     : x={rv_x:.2f}  y={rv_y:.2f}  z={rv_z:.2f}")
-
-
-def run_axis_test(q_array_wxyz, axis_name, expected_robot_axis):
-    """
-    Axis-test utility: scans the quaternion array for the sample with the
-    largest rotation around a specific tracker axis, then reports what the
-    robot output would be for that sample.
-
-    Parameters
-    ----------
-    q_array_wxyz  : Nx4 array, internal [w,x,y,z] convention
-    axis_name     : 'ROLL' | 'PITCH' | 'YAW'  (tracker axis label)
-    expected_robot_axis : string describing expected robot axis (for display)
-
-    Usage in console / notebook:
-        run_axis_test(q_array, 'YAW', 'robot Yaw')
-    """
-    q_ref = normalize_quat(q_array_wxyz[0])
-    max_angle = 0.0
-    max_idx   = 0
-
-    for i in range(len(q_array_wxyz)):
-        q = normalize_quat(q_array_wxyz[i])
-        q_rel = normalize_quat(quat_multiply(quat_conjugate(q_ref), q))
-        if q_rel[0] < 0:
-            q_rel = -q_rel
-        ang = 2.0 * np.degrees(np.arccos(np.clip(q_rel[0], -1.0, 1.0)))
-        if ang > max_angle:
-            max_angle = ang
-            max_idx   = i
-
-    q_peak = normalize_quat(q_array_wxyz[max_idx])
-    q_rel_peak = normalize_quat(quat_multiply(quat_conjugate(q_ref), q_peak))
-    if q_rel_peak[0] < 0:
-        q_rel_peak = -q_rel_peak
-
-    roll_d, pitch_d, yaw_d = quat_to_rpy(q_rel_peak)
-    rv_x, rv_y, rv_z = quat_to_rotvec_degrees(q_rel_peak)
-
-    print(f"\n[AXIS TEST] Tracker motion: {axis_name}")
-    print(f"  Peak rotation angle : {max_angle:.1f} deg  (at sample {max_idx})")
-    print(f"  Expected robot axis : {expected_robot_axis}")
-    print(
-        f"  Delta Q at peak    : w={q_rel_peak[0]:.4f} x={q_rel_peak[1]:.4f} "
-        f"y={q_rel_peak[2]:.4f} z={q_rel_peak[3]:.4f}"
-    )
-    print(f"  Rotvec tracker     : x={rv_x:.2f}  y={rv_y:.2f}  z={rv_z:.2f}")
-    print(
-        f"  Robot output RPY   : roll={roll_d:.2f}  pitch={pitch_d:.2f}  yaw={yaw_d:.2f}"
-    )
-    print(
-        f"  Tracker motion detected: {axis_name} {max_angle:+.1f}°  →  "
-        f"Roll={roll_d:.1f}°  Pitch={pitch_d:.1f}°  Yaw={yaw_d:.1f}°"
-    )
 
 # ==========================================
 # FIND BAD TRACKER JUMPS
@@ -691,63 +569,72 @@ with open(OUTPUT_FILE, "w") as f:
         )
         prev_q_current = q_current.copy()
 
-        # ── ORIENTATION PIPELINE (corrected) ──────────────────────────────────
-        #
-        # Previous code computed q_rel = conj(q0)*q_curr (correct),
-        # then extracted a SECOND step-delta from adjacent q_rel values,
-        # converted that step-delta to a rotvec, and ACCUMULATED the rotvec
-        # components. This double-differencing + re-integration drifts when
-        # rotations occur around more than one axis simultaneously.
-        #
-        # Fix: q_rel already IS the total rotation from the reference pose.
-        # Convert q_rel directly to RPY. No accumulation needed.
-        #
-        # All three variables below (orient_roll/pitch/yaw) and the prev_q_rel
-        # bookkeeping are now unused. They are left initialised above to avoid
-        # any NameError in code paths not shown here, but play no role.
-        # ──────────────────────────────────────────────────────────────────────
-
         q_rel = quat_multiply(
             quat_conjugate(q0),
             q_current
         )
         q_rel = normalize_quat(q_rel)
+        q_rel = keep_quat_same_hemisphere(
+            q_rel,
+            prev_q_rel
+        )
 
-        # Keep q_rel on positive-w hemisphere for numerical stability
-        if q_rel[0] < 0:
-            q_rel = -q_rel
-
-        # Extract RPY directly from q_rel (no gains, no accumulated drift)
-        droll, dpitch, dyaw = quat_to_rpy(q_rel)
-
-        # ── Orientation diagnostics (printed for first 5 samples and every 50th) ──
-        if count <= 5 or count % 50 == 0:
-            rel_angle_deg = 2.0 * np.degrees(
-                np.arccos(np.clip(q_rel[0], -1.0, 1.0))
+        if prev_q_rel is None:
+            q_delta = q_rel.copy()
+        else:
+            q_delta = quat_multiply(
+                quat_conjugate(prev_q_rel),
+                q_rel
             )
-            rv_x, rv_y, rv_z = quat_to_rotvec_degrees(q_rel)
+
+        q_delta = normalize_quat(q_delta)
+        if q_delta[0] < 0:
+            q_delta = -q_delta
+
+        delta_angle = 2 * np.degrees(
+            np.arccos(
+                np.clip(q_delta[0], -1.0, 1.0)
+            )
+        )
+
+        if 110 <= count <= 130:
             print(
-                f"[ORIENT] sample={count}  "
-                f"RAW Q: w={q_current[0]:.4f} x={q_current[1]:.4f} "
-                f"y={q_current[2]:.4f} z={q_current[3]:.4f}"
-            )
-            print(
-                f"         DELTA Q: w={q_rel[0]:.4f} x={q_rel[1]:.4f} "
-                f"y={q_rel[2]:.4f} z={q_rel[3]:.4f}  "
-                f"ANGLE DEG: {rel_angle_deg:.2f}"
-            )
-            print(
-                f"         Robot output: roll={droll:.2f}  "
-                f"pitch={dpitch:.2f}  yaw={dyaw:.2f}"
+                f"REAL ROTATION = {delta_angle:.2f} deg"
             )
 
+        step_roll, step_pitch, step_yaw = quat_to_rotvec_degrees(q_delta)
+
+        orient_roll += step_roll
+        orient_pitch += step_pitch
+        orient_yaw += step_yaw
+
+        prev_q_rel = q_rel.copy()
+        #if count < 10:
+        #    print(
+        #        f"QREL "
+        #        f"{q_rel[0]:.4f} "
+        #        f"{q_rel[1]:.4f} "
+        #        f"{q_rel[2]:.4f} "
+        #        f"{q_rel[3]:.4f}"
+        #    )
+
+        droll = orient_roll
+        dpitch = orient_pitch
+        dyaw = orient_yaw
         debug_mode = (
             DEBUG_START <= count <= DEBUG_END
         )
+        if count >= 185 and count <= 195:
+            print(
+                f"ROTVEC "
+                f"X={droll:.1f} "
+                f"Y={dpitch:.1f} "
+                f"Z={dyaw:.1f}"
+            )
 
-        ROLL_GAIN  = 1.0   # no artificial attenuation: q_rel is already relative
-        PITCH_GAIN = 1.0
-        YAW_GAIN   = 1.0
+        ROLL_GAIN = 0.3
+        PITCH_GAIN = 0.3
+        YAW_GAIN = 0.3
 
         pr   = START_ROLL  + droll  * ROLL_GAIN
         pp   = START_PITCH + dpitch * PITCH_GAIN
@@ -926,26 +813,6 @@ with open(OUTPUT_FILE, "w") as f:
         last_pz = pz
 
         count += 1
-
-# ==========================================
-# ORIENTATION AXIS TESTS
-# ==========================================
-# Build the quaternion array in internal [w,x,y,z] convention for the tests.
-# These functions show which tracker axis drives which robot axis,
-# so you can verify and add a frame-mapping transform when needed.
-# ==========================================
-
-_q_all = np.column_stack([qw, qx, qy, qz])   # shape (N, 4), internal [w,x,y,z]
-
-print("\n" + "=" * 60)
-print("ORIENTATION AXIS TEST SUMMARY")
-print("=" * 60)
-print("(Shows which tracker rotation produces which robot RPY delta)")
-print("(Run with a dataset where you rotate the tracker one axis at a time)")
-run_axis_test(_q_all, 'ROLL  (tracker X-axis rotation)',  'robot Roll?')
-run_axis_test(_q_all, 'PITCH (tracker Y-axis rotation)', 'robot Pitch?')
-run_axis_test(_q_all, 'YAW   (tracker Z-axis rotation)',  'robot Yaw?')
-print("=" * 60)
 
 # ==========================================
 # FAIRINO IK ANALYSIS — END-OF-RUN REPORT
