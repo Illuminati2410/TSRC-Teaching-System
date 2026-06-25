@@ -421,7 +421,7 @@ class TrackerReader:
             return False
         
         # Try to parse binary digit
-        digits = re.findall(r"(?<![ -9.-])[01](?![\d.-])", upper)
+        digits = re.findall(r"(?<![0-9.-])[01](?![0-9.-])", upper)
         if digits:
             return digits[-1] == "1"
         
