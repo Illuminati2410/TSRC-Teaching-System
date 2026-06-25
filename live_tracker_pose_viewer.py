@@ -1,8 +1,8 @@
 import csv
 import json
 import re
-import subprocess
 import sys
+import time
 from collections import deque
 from dataclasses import asdict, dataclass
 
@@ -10,6 +10,8 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 import pyqtgraph.opengl as gl
 from scipy.spatial.transform import Rotation as R
+
+from tracker_core import TrackerReader
 
 
 SURVIVE_EXE = r"C:\Users\Shaurya\libsurvive\build-win\Release\survive-cli.exe"
@@ -36,19 +38,6 @@ DISPLAY_BASIS = np.array(
 
 
 @dataclass
-class PoseSample:
-    x: float
-    y: float
-    z: float
-    qx: float
-    qy: float
-    qz: float
-    qw: float
-    button_pressed: bool
-    seq: int
-
-
-@dataclass
 class CapturePoint:
     x: float
     y: float
@@ -57,154 +46,6 @@ class CapturePoint:
     qy: float
     qz: float
     qw: float
-
-
-class PoseReaderThread(QtCore.QThread):
-    status_message = QtCore.pyqtSignal(str)
-
-    def __init__(self, survive_exe, target_device):
-        super().__init__()
-        self.survive_exe = survive_exe
-        self.target_device = target_device
-        self._mutex = QtCore.QMutex()
-        self._latest_pose = None
-        self._button_pressed = False
-        self._button_available = False
-        self._seq = 0
-        self._running = True
-        self._proc = None
-
-    def run(self):
-        try:
-            self._proc = subprocess.Popen(
-                [self.survive_exe, "--record-stdout"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
-        except Exception as exc:
-            self.status_message.emit(f"Failed to start survive-cli: {exc}")
-            return
-
-        self.status_message.emit("survive-cli running")
-
-        while self._running and self._proc and self._proc.stdout:
-            line = self._proc.stdout.readline()
-            if not line:
-                if self._proc.poll() is not None:
-                    break
-                continue
-
-            sample = self._parse_pose_line(line)
-            if sample is not None:
-                with QtCore.QMutexLocker(self._mutex):
-                    self._seq += 1
-                    self._latest_pose = PoseSample(
-                        x=sample["x"],
-                        y=sample["y"],
-                        z=sample["z"],
-                        qx=sample["qx"],
-                        qy=sample["qy"],
-                        qz=sample["qz"],
-                        qw=sample["qw"],
-                        button_pressed=self._button_pressed,
-                        seq=self._seq,
-                    )
-                continue
-
-            button_state = self._parse_button_line(line)
-            if button_state is not None:
-                with QtCore.QMutexLocker(self._mutex):
-                    self._button_available = True
-                    self._button_pressed = button_state
-                    if self._latest_pose is not None:
-                        self._latest_pose.button_pressed = button_state
-
-        self._stop_process()
-
-    def snapshot(self):
-        with QtCore.QMutexLocker(self._mutex):
-            if self._latest_pose is None:
-                return None
-            return PoseSample(**asdict(self._latest_pose))
-
-    def button_available(self):
-        with QtCore.QMutexLocker(self._mutex):
-            return self._button_available
-
-    def stop(self):
-        self._running = False
-        self.wait(1000)
-        self._stop_process()
-
-    def _stop_process(self):
-        if self._proc is None:
-            return
-        try:
-            if self._proc.poll() is None:
-                self._proc.terminate()
-                self._proc.wait(timeout=2)
-        except Exception:
-            try:
-                self._proc.kill()
-            except Exception:
-                pass
-        finally:
-            self._proc = None
-
-    def _parse_pose_line(self, line):
-        if self.target_device not in line or "POSE" not in line:
-            return None
-
-        parts = line.strip().split()
-        try:
-            pose_index = parts.index("POSE")
-        except ValueError:
-            return None
-
-        if len(parts) <= pose_index + 7:
-            return None
-
-        try:
-            x = float(parts[pose_index + 1])
-            y = float(parts[pose_index + 2])
-            z = float(parts[pose_index + 3])
-            qw = float(parts[pose_index + 4])
-            qx = float(parts[pose_index + 5])
-            qy = float(parts[pose_index + 6])
-            qz = float(parts[pose_index + 7])
-        except ValueError:
-            return None
-
-        return {
-            "x": x,
-            "y": y,
-            "z": z,
-            "qx": qx,
-            "qy": qy,
-            "qz": qz,
-            "qw": qw,
-        }
-
-    def _parse_button_line(self, line):
-        upper = line.upper()
-        if self.target_device not in upper and "BUTTON" not in upper and "BTN" not in upper:
-            return None
-
-        if "PRESSED" in upper:
-            return True
-        if "RELEASED" in upper:
-            return False
-
-        if "BUTTON" not in upper and "BTN" not in upper:
-            return None
-
-        digits = re.findall(r"(?<![\d.-])[01](?![\d.-])", upper)
-        if digits:
-            return digits[-1] == "1"
-
-        return None
 
 
 class TrackerViewWidget(gl.GLViewWidget):
@@ -266,8 +107,9 @@ class LiveTrackerPoseViewer(QtWidgets.QMainWindow):
         self.setWindowTitle("Live Vive Tracker Pose Viewer")
         self.resize(1400, 900)
 
-        self.reader = PoseReaderThread(SURVIVE_EXE, TARGET_DEVICE)
-        self.reader.status_message.connect(self._set_status)
+        # Create tracker reader
+        self.reader = TrackerReader(SURVIVE_EXE, TARGET_DEVICE)
+        self.reader.start()
 
         self.view = TrackerViewWidget()
         self.view.setBackgroundColor((18, 20, 24))
@@ -291,8 +133,6 @@ class LiveTrackerPoseViewer(QtWidgets.QMainWindow):
         self.render_timer = QtCore.QTimer(self)
         self.render_timer.timeout.connect(self._render_latest_pose)
         self.render_timer.start(int(1000 / RENDER_FPS))
-
-        self.reader.start()
 
     def closeEvent(self, event):
         self.reader.stop()
@@ -365,7 +205,7 @@ class LiveTrackerPoseViewer(QtWidgets.QMainWindow):
         self.pose_label.setTextFormat(QtCore.Qt.RichText)
         info_layout.addWidget(self.pose_label)
 
-        self.status_label = QtWidgets.QLabel("Starting survive-cli...")
+        self.status_label = QtWidgets.QLabel("Starting tracker...")
         self.status_label.setStyleSheet("font-size: 12px; color: #9cc7ff;")
         info_layout.addWidget(self.status_label)
         self.info_panel.adjustSize()
@@ -442,7 +282,7 @@ class LiveTrackerPoseViewer(QtWidgets.QMainWindow):
         return DISPLAY_BASIS @ rotation_matrix @ DISPLAY_BASIS.T
 
     def _render_latest_pose(self):
-        sample = self.reader.snapshot()
+        sample = self.reader.get_latest_pose()
         if sample is None or sample.seq == self.last_rendered_seq:
             return
 
@@ -476,7 +316,7 @@ class LiveTrackerPoseViewer(QtWidgets.QMainWindow):
                     f"X = {sample.x * 1000:.1f} mm",
                     f"Y = {sample.y * 1000:.1f} mm",
                     f"Z = {sample.z * 1000:.1f} mm",
-                    ]
+                ]
             )
         )
 
@@ -589,7 +429,7 @@ class LiveTrackerPoseViewer(QtWidgets.QMainWindow):
 
         button_text = "Pressed" if effective_button else "Released"
         button_color = "#73ff8f" if effective_button else "#ffffff"
-        if self.reader.button_available():
+        if self.reader.is_button_available():
             button_source = "tracker"
         elif self.manual_button_pressed:
             button_source = "manual"
