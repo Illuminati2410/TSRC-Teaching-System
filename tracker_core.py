@@ -141,7 +141,7 @@ class TrackerReader:
         self._running = False
         
         if self._thread:
-            self._thread.join(timeout=1.0)
+            self._thread.join(timeout=2.0)
         
         self._stop_process()
 
@@ -157,7 +157,7 @@ class TrackerReader:
             if self._latest_pose is None:
                 return None
             
-            # Return a copy
+            # Return a copy to prevent external modification
             pose = self._latest_pose
             return TrackerPose(
                 x=pose.x,
@@ -171,6 +171,16 @@ class TrackerReader:
                 button_pressed=pose.button_pressed,
                 seq=pose.seq,
             )
+
+    def get_tracker_neutral_reference(self) -> tuple:
+        """
+        Get the tracker neutral reference position (in meters).
+        
+        Returns:
+            Tuple (x0, y0, z0) or (None, None, None) if not yet calibrated
+        """
+        with self._lock:
+            return (self._tracker_x0, self._tracker_y0, self._tracker_z0)
 
     def is_button_available(self) -> bool:
         """Check if tracker button state is available."""
@@ -325,7 +335,7 @@ class TrackerReader:
         self._reject_z = None
         self._stable_rejects = 0
         
-        # Store latest pose
+        # Store latest pose (atomically with lock)
         with self._lock:
             self._seq += 1
             self._latest_pose = TrackerPose(

@@ -23,6 +23,9 @@ TRACKER_AXIS_LENGTH_MM = 120
 GLOBAL_AXIS_LENGTH_MM = 70
 MAX_TRAIL_SEGMENTS = 800
 
+# Debug flag - set to True to enable debug output
+DEBUG = False
+
 # Display tracker axes directly with no remapping:
 #   Red   = +X
 #   Green = +Y
@@ -101,6 +104,85 @@ class TrackerViewWidget(gl.GLViewWidget):
         return origin + direction * t
 
 
+class OptimizedTrailRenderer:
+    """
+    Optimized trail renderer using a single GLLinePlotItem.
+    Updates vertex list instead of creating new objects each frame.
+    """
+    
+    def __init__(self, parent_view):
+        self.parent_view = parent_view
+        self.trail_item = None
+        self.trail_points = deque(maxlen=MAX_TRAIL_SEGMENTS + 1)
+        self.trail_colors = deque(maxlen=MAX_TRAIL_SEGMENTS)
+        self._create_trail_item()
+    
+    def _create_trail_item(self):
+        """Create initial trail rendering object."""
+        self.trail_item = gl.GLLinePlotItem(
+            pos=np.empty((0, 3), dtype=float),
+            color=(1.0, 1.0, 1.0, 0.85),
+            width=2,
+            antialias=True,
+        )
+        self.parent_view.addItem(self.trail_item)
+    
+    def add_segment(self, position, button_pressed):
+        """
+        Add a new segment to the trail.
+        
+        Args:
+            position: np.array of shape (3,) with new position
+            button_pressed: bool indicating button state
+        """
+        if len(self.trail_points) == 0:
+            # First point
+            self.trail_points.append(position.copy())
+            return
+        
+        # Add color for this segment
+        color = (0.2, 1.0, 0.35, 1.0) if button_pressed else (1.0, 1.0, 1.0, 0.85)
+        self.trail_colors.append(color)
+        
+        # Add new point
+        self.trail_points.append(position.copy())
+        
+        # Update trail rendering
+        self._update_trail_mesh()
+    
+    def _update_trail_mesh(self):
+        """Update the trail mesh with current points."""
+        if len(self.trail_points) < 2:
+            return
+        
+        # Build position array with line segments
+        # For a trail with n points, we need 2*(n-1) vertices for n-1 segments
+        points_array = np.array(list(self.trail_points), dtype=float)
+        
+        # Build interleaved vertex pairs for line segments
+        segments = []
+        for i in range(len(points_array) - 1):
+            segments.append(points_array[i])
+            segments.append(points_array[i + 1])
+        
+        if segments:
+            pos = np.array(segments, dtype=float)
+            self.trail_item.setData(pos=pos)
+    
+    def clear(self):
+        """Clear all trail points."""
+        self.trail_points.clear()
+        self.trail_colors.clear()
+        if self.trail_item:
+            self.trail_item.setData(pos=np.empty((0, 3), dtype=float))
+    
+    def remove_from_view(self):
+        """Remove trail from view (for cleanup)."""
+        if self.trail_item and self.parent_view:
+            self.parent_view.removeItem(self.trail_item)
+            self.trail_item = None
+
+
 class LiveTrackerPoseViewer(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -124,7 +206,9 @@ class LiveTrackerPoseViewer(QtWidgets.QMainWindow):
         self.last_button_pressed = False
         self.manual_button_pressed = False
         self.captured_points = []
-        self.trail_segments = deque()
+        
+        # Use optimized trail renderer
+        self.trail_renderer = OptimizedTrailRenderer(self.view)
         self._last_trail_position = None
 
         self._build_scene()
@@ -135,6 +219,7 @@ class LiveTrackerPoseViewer(QtWidgets.QMainWindow):
         self.render_timer.start(int(1000 / RENDER_FPS))
 
     def closeEvent(self, event):
+        self.trail_renderer.remove_from_view()
         self.reader.stop()
         super().closeEvent(event)
 
@@ -297,8 +382,8 @@ class LiveTrackerPoseViewer(QtWidgets.QMainWindow):
         position = self._transform_position_to_view(tracker_position)
         rotation = self._transform_rotation_to_view(tracker_rotation)
 
-        # DEBUG TRANSLATION SMOOTHNESS
-        if hasattr(self, "_prev_pos"):
+        # DEBUG: Translation smoothness (only when DEBUG flag is enabled)
+        if DEBUG and hasattr(self, "_prev_pos"):
             step = np.linalg.norm(position - self._prev_pos)
             print(f"step = {step:.6f}")
 
@@ -385,24 +470,10 @@ class LiveTrackerPoseViewer(QtWidgets.QMainWindow):
         self._set_status(f"Exported JSON: {path}")
 
     def _append_trail_segment(self, position, button_pressed):
-        if self._last_trail_position is None:
-            self._last_trail_position = position
-            return
-
-        color = (0.2, 1.0, 0.35, 1.0) if button_pressed else (1.0, 1.0, 1.0, 0.85)
-        segment = gl.GLLinePlotItem(
-            pos=np.array([self._last_trail_position, position], dtype=float),
-            color=color,
-            width=2,
-            antialias=True,
-        )
-        self.view.addItem(segment)
-        self.trail_segments.append(segment)
-        self._last_trail_position = position
-
-        while len(self.trail_segments) > MAX_TRAIL_SEGMENTS:
-            old_segment = self.trail_segments.popleft()
-            self.view.removeItem(old_segment)
+        """
+        Append a segment to the trail using optimized renderer.
+        """
+        self.trail_renderer.add_segment(position, button_pressed)
 
     def _update_capture_markers(self):
         if not self.captured_points:

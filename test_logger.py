@@ -4,6 +4,7 @@ import csv
 import math
 import os
 import sys
+import time
 
 from tracker_core import TrackerReader
 
@@ -73,6 +74,12 @@ def main():
     last_pitch = None
     last_yaw = None
     last_seq = -1
+    
+    # Tracker reference (will be populated after stabilization)
+    tracker_x0 = None
+    tracker_y0 = None
+    tracker_z0 = None
+    reference_captured = False
 
     # Open CSV for writing
     with open(csv_file, "w", newline="") as f:
@@ -107,13 +114,22 @@ def main():
                 pose = reader.get_latest_pose()
                 
                 if pose is None:
+                    # Avoid busy waiting: sleep briefly when no new pose
+                    time.sleep(0.005)
                     continue
                 
                 # Skip duplicate samples
                 if pose.seq == last_seq:
+                    # Avoid busy waiting: sleep briefly when no new pose
+                    time.sleep(0.005)
                     continue
                 
                 last_seq = pose.seq
+                
+                # Capture tracker neutral reference on first valid pose
+                if not reference_captured:
+                    tracker_x0, tracker_y0, tracker_z0 = reader.get_tracker_neutral_reference()
+                    reference_captured = True
 
                 # Compute Euler angles
                 raw_roll, raw_pitch, raw_yaw = quat_to_rpy(
@@ -144,15 +160,15 @@ def main():
                     f"Y={raw_yaw:.1f}°"
                 )
 
-                # Write to CSV
+                # Write to CSV with actual tracker reference values
                 writer.writerow([
                     pose.timestamp,
                     pose.x,
                     pose.y,
                     pose.z,
-                    0.0,  # tracker_x0 (would come from reader if needed)
-                    0.0,  # tracker_y0
-                    0.0,  # tracker_z0
+                    tracker_x0 if tracker_x0 is not None else 0.0,
+                    tracker_y0 if tracker_y0 is not None else 0.0,
+                    tracker_z0 if tracker_z0 is not None else 0.0,
                     pose.qx,
                     pose.qy,
                     pose.qz,
